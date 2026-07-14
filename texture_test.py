@@ -126,3 +126,5 @@ def plot_grey(img, title="", percentile=(1, 99)):
 
 plot_grey(before_Sobel, "Before Sobel")
 plot_grey(after_Sobel, "After Sobel")
+
+plt.show()
