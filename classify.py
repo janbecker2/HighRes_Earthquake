@@ -1,180 +1,296 @@
-"""
-Standalone inference script (PIXEL-WISE) with Building Masking:
-- Loads the saved VGG16 model
-- Loads Microsoft Building Footprints and creates a binary mask
-- Classifies raster pixel-by-pixel, SKIPPING areas with no buildings
-- Saves a georeferenced GeoTIFF
-- Plots the classification result
-"""
-
-# ============================================================
-# IMPORTS
-# ============================================================
 import numpy as np
-import matplotlib.pyplot as plt
 
-import rasterio
-from rasterio.crs import CRS
-from rasterio.windows import Window
-from rasterio.features import rasterize
+import torch
+import torch.nn as nn
+from torchvision import models
 
 import geopandas as gpd
-import tensorflow as tf
+import rasterio
+from rasterio.windows import Window, from_bounds
+from shapely.geometry import box
+
 
 # ============================================================
 # CONFIG
+# (Keep this identical to the Config in train_tif_ready.py --
+# MODEL_PATH, CHIP_SIZE, NORM_MEAN/STD, and CLASS_NAMES all need to match
+# whatever the model was actually trained with.)
 # ============================================================
-MODEL_PATH       = r"C:\Users\job02\Downloads\vgg16_destroyed.keras"
-INFER_RASTER     = r"C:\Users\job02\Downloads\aoi_clips\aoi_clips\after_aoi_clip.tif"
-OUTPUT_RASTER    = r"C:\Users\job02\Downloads\aoi_clips\aoi_clips\classification.tif"
+class Config:
+    CHIP_SIZE    = 224          # ResNet default input size -- must match training
 
-# ADD YOUR BUILDING FOOTPRINTS FILE HERE (GeoJSON, Shapefile, or GeoPackage)
-BUILDINGS_VECTOR = r"C:\Users\job02\Downloads\ms_buildings_pre_earthquake.geojson"
+    # --- Model file ---
+    MODEL_PATH   = r"C:\Users\job02\Downloads\resnet50_damaged_wo_b1.pth"
 
-CHIP_SIZE = 128          
-THRESHOLD = 0.5          
-STRIDE    = 16           
-MANUAL_CRS = "EPSG:32637"
+    # --- Inference (footprints + big tif) ---
+    INFER_RASTER = r"C:\Users\job02\Downloads\study1_textures.tif\study1_test_stack.tif"
+    FOOTPRINTS   = r"C:\Users\job02\Downloads\2023Turkey_earthquake_data\2023Turkey_earthquake_data\GBA_building_footprint\Turkey_GBA_building_data.shp"
+    FOOT_LAYER   = None
+    OUTPUT_GPKG  = r"C:\Users\job02\Downloads\buildings_classified.gpkg"
+    PAD_FRAC     = 0.15
+    BATCH_INFER  = 64
+    DEFAULT_THRESHOLD = 0.5    # Fallback if no threshold metadata found
+
+    # ImageNet normalization -- must match training
+    NORM_MEAN = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    NORM_STD  = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+
+    CLASS_NAMES  = {0: "destroyed", 1: "undestroyed"}
+
+
+cfg = Config()
+
 
 # ============================================================
-# LOAD MODEL
+# DEVICE
 # ============================================================
-print("Loading model...")
-model = tf.keras.models.load_model(MODEL_PATH)
-print("Model loaded.")
+def get_device():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    return device
+
 
 # ============================================================
-# PREPARE DATA & MASK
+# MODEL (must match the architecture used in training exactly, or
+# load_state_dict will fail / silently load into the wrong shapes)
 # ============================================================
-print("\nPreparing building mask...")
-with rasterio.open(INFER_RASTER) as src:
-    width, height = src.width, src.height
-    profile = src.profile.copy()
-    raster_crs = src.crs or CRS.from_user_input(MANUAL_CRS)
-    profile.update(count=1, dtype="uint8", nodata=255, crs=raster_crs)
+def build_model(device, freeze_backbone=False):
+    weights = models.ResNet50_Weights.IMAGENET1K_V2
+    model = models.resnet50(weights=weights)
 
-    # Load buildings
-    buildings_gdf = gpd.read_file(BUILDINGS_VECTOR)
-    
-    # Ensure CRS matches the raster
-    if buildings_gdf.crs != raster_crs:
-        print(f"Reprojecting buildings from {buildings_gdf.crs} to {raster_crs}...")
-        buildings_gdf = buildings_gdf.to_crs(raster_crs)
-    
-    # Rasterize building footprints (1 for building, 0 for background)
-    shapes = ((geom, 1) for geom in buildings_gdf.geometry if geom is not None)
-    building_mask = rasterize(
-        shapes=shapes,
-        out_shape=(height, width),
-        transform=src.transform,
-        fill=0,
-        dtype="uint8"
+    # --- 6-BAND MODIFICATION ---
+    old_conv = model.conv1
+    # Create a new layer with 6 input channels instead of 3
+    model.conv1 = nn.Conv2d(6, old_conv.out_channels, 
+                            kernel_size=old_conv.kernel_size, 
+                            stride=old_conv.stride, 
+                            padding=old_conv.padding, 
+                            bias=old_conv.bias is not None)
+    # ---------------------------
+
+    if freeze_backbone:
+        for p in model.parameters():
+            p.requires_grad = False
+
+    in_feats = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Linear(in_feats, 256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.4),
+        nn.Linear(256, 1),
+    )
+    return model.to(device)
+
+
+def load_model(device, model_path=None):
+    """Load a saved model checkpoint for inference."""
+    model_path = model_path or cfg.MODEL_PATH
+    checkpoint = torch.load(model_path, map_location=device)
+
+    model = build_model(device, freeze_backbone=False)
+
+    if "state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["state_dict"])
+        optimal_threshold = checkpoint.get("optimal_threshold", cfg.DEFAULT_THRESHOLD)
+    else:
+        model.load_state_dict(checkpoint)
+        optimal_threshold = cfg.DEFAULT_THRESHOLD
+
+    model.eval()
+    print(f"Loaded model from: {model_path}")
+    print(f"Using loaded Optimal Decision Threshold: {optimal_threshold:.4f}")
+    return model, optimal_threshold
+
+
+# ============================================================
+# RASTER SCALING
+# Same dtype-aware scaling used in train_tif_ready.py's rasterio_pil_loader.
+# Keeping this identical between train and inference is what makes the
+# model's learned weights meaningful at inference time -- if training
+# chips were scaled one way (e.g. 16-bit -> /65535) and inference chips
+# another way (e.g. always /255), the model sees systematically different
+# input statistics than it was trained on.
+# ============================================================
+def scale_raster_array(arr, src_dtype=None):
+    """Scale a raw raster array (any band count, any dtype) to 0-255 float32."""
+    arr = np.nan_to_num(arr.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
+    dtype_str = str(src_dtype) if src_dtype is not None else None
+
+    if dtype_str == "uint8":
+        pass  # already 0-255
+    elif dtype_str == "uint16":
+        arr = arr / 65535.0 * 255.0
+    elif dtype_str == "int16":
+        arr = np.clip(arr, 0, None) / 32767.0 * 255.0
+    elif dtype_str in ("float32", "float64") or dtype_str is None:
+        m = arr.max()
+        if m <= 1.5:
+            arr = arr * 255.0          # already 0-1 float
+        elif m <= 255.5:
+            pass                        # already 0-255
+        else:
+            arr = arr / max(m, 1.0) * 255.0  # fallback: per-chip max scaling
+    else:
+        m = arr.max()
+        arr = arr / max(m, 1.0) * 255.0
+
+    return np.clip(arr, 0, 255)
+
+
+def _chip_to_tensor(chip_hwc, chip_size, src_dtype=None):
+    """(6,H,W) raw raster values -> resized + ImageNet-normalized tensor
+    (6,chip,chip). Scales using the raster's actual dtype (via
+    scale_raster_array) instead of assuming 8-bit input."""
+    chip = scale_raster_array(chip_hwc, src_dtype=src_dtype)  # -> 0-255 float32
+    chip = chip / 255.0                                        # -> 0-1
+
+    t = torch.from_numpy(chip).unsqueeze(0)    # (1,6,H,W)
+    t = torch.nn.functional.interpolate(
+        t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
+    ).squeeze(0)                               # (6,chip,chip)
+
+    # Update the view from 3 to 6
+    mean = torch.tensor(cfg.NORM_MEAN).view(6, 1, 1)
+    std  = torch.tensor(cfg.NORM_STD).view(6, 1, 1)
+    t = (t - mean) / std
+    return t
+
+
+# ============================================================
+# INFERENCE (Footprint-based)
+# ============================================================
+def classify_footprints(model, device, threshold=None,
+                        infer_raster=None, footprints=None,
+                        output_gpkg=None, foot_layer=None,
+                        pad_frac=None, batch_infer=None, class_names=None):
+    """Classify each building footprint that falls within the raster extent."""
+    infer_raster = infer_raster or cfg.INFER_RASTER
+    footprints   = footprints   or cfg.FOOTPRINTS
+    output_gpkg  = output_gpkg  or cfg.OUTPUT_GPKG
+    foot_layer   = foot_layer   if foot_layer is not None else cfg.FOOT_LAYER
+    pad_frac     = pad_frac     if pad_frac    is not None else cfg.PAD_FRAC
+    batch_infer  = batch_infer  or cfg.BATCH_INFER
+    threshold    = threshold    if threshold   is not None else cfg.DEFAULT_THRESHOLD
+    class_names  = class_names  or cfg.CLASS_NAMES
+
+    class_for_1 = class_names[1]
+    class_for_0 = class_names[0]
+    print(f"\n--- Running Inference ---")
+    print(f"Applying Threshold: prob >= {threshold:.4f} -> '{class_for_1}', else '{class_for_0}'")
+
+    with rasterio.open(infer_raster) as src:
+        raster_crs    = src.crs
+        raster_bounds = src.bounds
+        raster_dtype  = src.dtypes[0]
+        H, W = src.height, src.width
+
+    if foot_layer is not None:
+        foot_crs = gpd.read_file(footprints, rows=1, layer=foot_layer).crs
+    else:
+        foot_crs = gpd.read_file(footprints, rows=1).crs
+
+    raster_box = gpd.GeoDataFrame(geometry=[box(*raster_bounds)], crs=raster_crs)
+    if foot_crs is not None and raster_box.crs != foot_crs:
+        raster_box_ft = raster_box.to_crs(foot_crs)
+    else:
+        raster_box_ft = raster_box
+    bbox_tuple = tuple(raster_box_ft.total_bounds)
+
+    print(f"Reading footprints within raster bbox...")
+    if foot_layer is not None:
+        gdf = gpd.read_file(footprints, layer=foot_layer, bbox=bbox_tuple)
+    else:
+        gdf = gpd.read_file(footprints, bbox=bbox_tuple)
+
+    if len(gdf) == 0:
+        raise RuntimeError("No footprints fall within the raster extent.")
+
+    if gdf.crs != raster_crs:
+        gdf = gdf.to_crs(raster_crs)
+
+    raster_box_rcrs = box(*raster_bounds)
+    gdf = gdf[gdf.geometry.intersects(raster_box_rcrs)].reset_index(drop=True)
+    print(f"Footprints intersecting raster: {len(gdf)}")
+
+    model.eval()
+    probs_out = np.full(len(gdf), np.nan, dtype="float32")
+
+    with rasterio.open(infer_raster) as src:
+        batch_tensors, batch_idx = [], []
+
+        def flush():
+            if not batch_tensors:
+                return
+            x = torch.stack(batch_tensors).to(device)
+            with torch.no_grad():
+                logits = model(x).squeeze(1)
+                p = torch.sigmoid(logits).cpu().numpy()  # logits -> probabilities
+            for gi, pv in zip(batch_idx, p):
+                probs_out[gi] = pv
+            batch_tensors.clear()
+            batch_idx.clear()
+
+        for gi, geom in enumerate(gdf.geometry):
+            if geom is None or geom.is_empty:
+                continue
+
+            minx, miny, maxx, maxy = geom.bounds
+            dx = (maxx - minx) * pad_frac
+            dy = (maxy - miny) * pad_frac
+            minx, maxx = minx - dx, maxx + dx
+            miny, maxy = miny - dy, maxy + dy
+
+            try:
+                win = from_bounds(minx, miny, maxx, maxy, src.transform)
+            except Exception:
+                continue
+
+            col_off = max(0, int(np.floor(win.col_off)))
+            row_off = max(0, int(np.floor(win.row_off)))
+            w = min(int(np.ceil(win.width)),  W - col_off)
+            h = min(int(np.ceil(win.height)), H - row_off)
+            if w < 2 or h < 2:
+                continue
+
+            window = Window(col_off, row_off, w, h)
+            chip = src.read(window=window).astype("float32")
+            
+            if chip.shape[1] < 2 or chip.shape[2] < 2:
+                continue
+
+            batch_tensors.append(_chip_to_tensor(chip, cfg.CHIP_SIZE, src_dtype=raster_dtype))
+            batch_idx.append(gi)
+
+            if len(batch_tensors) >= batch_infer:
+                flush()
+            if (gi + 1) % 2000 == 0:
+                print(f"  {gi+1}/{len(gdf)} buildings processed")
+
+        flush()
+
+    gdf["prob"] = probs_out
+    gdf["pred_class"] = np.where(
+        np.isnan(probs_out), "no_data",
+        np.where(probs_out >= threshold, class_for_1, class_for_0)
     )
 
-# ============================================================
-# PIXEL-WISE INFERENCE (Masked)
-# ============================================================
-print("\nStarting masked pixel-wise classification...")
+    n_ok  = int(np.isfinite(probs_out).sum())
+    n_dmg = int((gdf["pred_class"] == class_for_1).sum())
+    print(f"Classified {n_ok}/{len(gdf)} buildings "
+          f"-> {n_dmg} '{class_for_1}', {n_ok - n_dmg} '{class_for_0}'")
 
-with rasterio.open(INFER_RASTER) as src:
-    prob_sum = np.zeros((height, width), dtype="float32")
-    count    = np.zeros((height, width), dtype="float32")
+    gdf.to_file(output_gpkg, driver="GPKG")
+    print(f"Saved classified footprints -> {output_gpkg}")
+    return gdf
 
-    tiles, coords = [], []
-    skipped_windows = 0
 
-    for r0 in range(0, height - CHIP_SIZE + 1, STRIDE):
-        for c0 in range(0, width - CHIP_SIZE + 1, STRIDE):
-            
-            # Check building mask first to save processing time
-            mask_chip = building_mask[r0:r0 + CHIP_SIZE, c0:c0 + CHIP_SIZE]
-            if mask_chip.max() == 0:
-                skipped_windows += 1
-                continue # Skip windows completely devoid of buildings
+def do_inference():
+    device = get_device()
+    model, optimal_threshold = load_model(device)
+    return classify_footprints(model, device, threshold=optimal_threshold)
 
-            window = Window(c0, r0, CHIP_SIZE, CHIP_SIZE)
-            chip = src.read([1, 2, 3], window=window).astype("float32")
-            chip = np.transpose(chip, (1, 2, 0))
-            if chip.max() > 1.0:
-                chip = chip / 255.0
-            
-            tiles.append(chip)
-            coords.append((r0, c0))
 
-    print(f"Total windows to process: {len(tiles)} (Skipped {skipped_windows} empty windows)")
-
-    BATCH = 64
-    all_probs = []
-    for i in range(0, len(tiles), BATCH):
-        batch = np.array(tiles[i:i + BATCH], dtype="float32")
-        p = model.predict(batch, verbose=0).ravel()
-        all_probs.extend(p)
-        if (i // BATCH) % 20 == 0:
-            print(f"  processed {min(i + BATCH, len(tiles))}/{len(tiles)} windows")
-
-    # accumulate probabilities
-    for (r0, c0), p in zip(coords, all_probs):
-        prob_sum[r0:r0 + CHIP_SIZE, c0:c0 + CHIP_SIZE] += p
-        count[r0:r0 + CHIP_SIZE, c0:c0 + CHIP_SIZE]    += 1.0
-
-    # Average valid predictions
-    valid = count > 0
-    prob_map = np.full((height, width), np.nan, dtype="float32")
-    prob_map[valid] = prob_sum[valid] / count[valid]
-
-    # Enforce precise pixel-level building mask (clip edges of overlapping windows)
-    no_building = (building_mask == 0)
-    prob_map[no_building] = np.nan
-
-    # Threshold -> hard class map
-    pred_map = np.full((height, width), 255, dtype="uint8")
-    valid_buildings = (valid) & (~no_building)
-    pred_map[valid_buildings] = (prob_map[valid_buildings] >= THRESHOLD).astype("uint8")
-
-print("Classification complete.")
-
-# ============================================================
-# WRITE RESULT
-# ============================================================
-with rasterio.open(OUTPUT_RASTER, "w", **profile) as dst:
-    dst.write(pred_map, 1)
-print(f"Saved masked classification map to:\n{OUTPUT_RASTER}")
-
-# ============================================================
-# PLOT RESULT
-# ============================================================
-plot_class = np.ma.masked_equal(pred_map, 255)
-plot_prob  = np.ma.masked_invalid(prob_map)
-
-fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-
-with rasterio.open(INFER_RASTER) as src:
-    rgb = src.read([1, 2, 3]).astype("float32")
-    if rgb.max() > 1.0:
-        rgb = rgb / 255.0
-    rgb = np.transpose(rgb, (1, 2, 0))
-
-axes[0].imshow(rgb)
-axes[0].set_title("Input image (RGB)")
-axes[0].axis("off")
-
-im1 = axes[1].imshow(plot_prob, cmap="RdYlGn_r", vmin=0, vmax=1)
-axes[1].set_title("Probability of 'destroyed' (Buildings Only)")
-axes[1].axis("off")
-fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-im2 = axes[2].imshow(plot_class, cmap="RdYlGn_r", vmin=0, vmax=1)
-axes[2].set_title(f"Classification (Buildings Only, thr={THRESHOLD})")
-axes[2].axis("off")
-cbar = fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04, ticks=[0, 1])
-cbar.ax.set_yticklabels(["Not destroyed", "Destroyed"])
-
-plt.tight_layout()
-plt.show()
-
-# --- Print class distribution ---
-unique, counts = np.unique(pred_map[pred_map != 255], return_counts=True)
-print("\nBuilding status distribution:")
-for u, c in zip(unique, counts):
-    name = "Destroyed" if u == 1 else "Not destroyed"
-    print(f"  {name} ({u}): {c} pixels")
+if __name__ == "__main__":
+    do_inference()

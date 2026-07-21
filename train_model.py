@@ -1,181 +1,433 @@
-"""
-Full pipeline: VGG16 transfer-learning binary classifier
-1) Train on shapefile + raster
-2) Save the model
-3) Pixel-wise classification of a new raster -> georeferenced GeoTIFF
-"""
-
-# ============================================================
-# IMPORTS
-# ============================================================
+import os
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+from torchvision.transforms import v2
+from sklearn.metrics import precision_recall_curve, f1_score
+from sklearn.model_selection import train_test_split
+
 import geopandas as gpd
 import rasterio
-from rasterio.windows import Window
-
-import tensorflow as tf
-from tensorflow.keras.layers import Flatten, Dense
-from tensorflow.keras.models import Model
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.optimizers import RMSprop
-
-# ============================================================
-# >>> CONFIG — EDIT THESE <<<
-# ============================================================
-TRAIN_SHP = r"C:\Users\job02\Downloads\Training_Data.shp"
-VAL_SHP   = r"C:\Users\job02\Downloads\Validation_Data.shp"
-RASTER    = r"C:\Users\job02\Downloads\ea_kahramanmaras.tif"
-
-LABEL_COL  = "destroyed"
-CHIP_SIZE  = 128
-BATCH_SIZE = 16
-EPOCHS     = 15
-
-MODEL_PATH = r"C:\Users\job02\Downloads\vgg16_destroyed.keras"
-
-INFER_RASTER  = r"C:\Users\job02\Downloads\aoi_clips\aoi_clips\after_aoi_clip.tif"
-OUTPUT_RASTER = r"C:\Users\job02\Downloads\aoi_clips\aoi_clips\classification.tif"
-THRESHOLD = 0.5
-
-# Pixel-wise method:
-#   STRIDE small  -> smoother, per-pixel-like result (slower)
-#   STRIDE = 16 or 8 is a good compromise between speed & smoothness
-STRIDE = 16
+from rasterio.windows import Window, from_bounds
+from shapely.geometry import box
+from PIL import Image
 
 
 # ============================================================
-# DATA LOADING: shapefile + raster -> image chips + labels
+# CONFIG
 # ============================================================
-def extract_chips(shp_path, raster_path, label_col, size=128):
-    gdf = gpd.read_file(shp_path)
+class Config:
+    # --- Training data (one subfolder per class) ---
+    TRAIN_DIR    = r"C:\Users\job02\Downloads\training_images_textures_without_b2"
+    VAL_SPLIT    = 0.2
+    CHIP_SIZE    = 224          # ResNet default input size
+    BATCH_SIZE   = 32
+    EPOCHS       = 40
+    LR           = 1e-4         # Base learning rate (head gets 10x, backbone less)
+    WEIGHT_DECAY = 1e-4         # Regularization against overfitting
+    FREEZE_BACKBONE = False     # False = full fine-tuning
+    PATIENCE     = 6            # Early stopping patience
+    SEED         = 42
+    SELECT_ON    = "val_f1"     # "val_loss" or "val_f1" -- metric used for checkpointing
+    USE_AMP      = True         # Mixed precision (only active if CUDA available)
 
-    matches = [c for c in gdf.columns if c.lower() == label_col.lower()]
-    if not matches:
-        raise KeyError(
-            f"Label column '{label_col}' not found in {shp_path}. "
-            f"Available columns: {list(gdf.columns)}"
-        )
-    actual_col = matches[0]
-    print(f"{shp_path}: using label column '{actual_col}'")
+    # --- Model file ---
+    MODEL_PATH   = r"C:\Users\job02\Downloads\resnet50_damaged_wo_b2.pth"
 
-    X, y = [], []
-    half = size // 2
+    # --- Inference (footprints + big tif) ---
+    INFER_RASTER = r"C:\Users\job02\Downloads\aoi_karamankaras.tif"
+    FOOTPRINTS   = r"C:\Users\job02\Downloads\2023Turkey_earthquake_data\2023Turkey_earthquake_data\GBA_building_footprint\Turkey_GBA_building_data.shp"
+    FOOT_LAYER   = None
+    OUTPUT_GPKG  = r"C:\Users\job02\Downloads\buildings_classified.gpkg"
+    PAD_FRAC     = 0.15
+    BATCH_INFER  = 64
+    DEFAULT_THRESHOLD = 0.5    # Fallback if no threshold metadata found
 
-    with rasterio.open(raster_path) as src:
-        if gdf.crs != src.crs:
-            gdf = gdf.to_crs(src.crs)
+    # ImageNet normalization 
+    NORM_MEAN = [0.485, 0.456, 0.406]
+    NORM_STD  = [0.229, 0.224, 0.225]
 
-        for _, row in gdf.iterrows():
-            geom = row.geometry
-            if geom is None:
-                continue
-            cx, cy = geom.centroid.x, geom.centroid.y
-            r, c = src.index(cx, cy)
-            r0, c0 = r - half, c - half
-
-            if r0 < 0 or c0 < 0 or r0 + size > src.height or c0 + size > src.width:
-                continue
-
-            window = Window(c0, r0, size, size)
-            chip = src.read([1, 2, 3], window=window).astype("float32")
-            chip = np.transpose(chip, (1, 2, 0))
-
-            X.append(chip)
-            y.append(float(row[actual_col]))
-
-    X = np.array(X, dtype="float32")
-    y = np.array(y, dtype="float32")
-
-    if X.size > 0 and X.max() > 1.0:
-        X /= 255.0
-
-    print(f"{shp_path}: extracted {len(X)} chips of shape "
-          f"{X.shape[1:] if len(X) else '(none)'}, "
-          f"labels: {np.unique(y) if len(y) else '(none)'}")
-    return X, y
+    CLASS_NAMES  = {0: "damaged", 1: "undamaged"}
 
 
-# Build the datasets
-X_train, y_train = extract_chips(TRAIN_SHP, RASTER, LABEL_COL, CHIP_SIZE)
-X_val,   y_val   = extract_chips(VAL_SHP,   RASTER, LABEL_COL, CHIP_SIZE)
+cfg = Config()
 
-if len(X_train) == 0 or len(X_val) == 0:
-    raise RuntimeError(
-        "No chips were extracted. Likely causes: shapefile points fall "
-        "outside the raster extent, or the CRS/raster path is wrong."
+
+# ============================================================
+# DEVICE
+# ============================================================
+def get_device():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    return device
+
+
+def build_model(device, freeze_backbone=None):
+    freeze_backbone = cfg.FREEZE_BACKBONE if freeze_backbone is None else freeze_backbone
+    torch.manual_seed(cfg.SEED)
+    np.random.seed(cfg.SEED)
+
+    weights = models.ResNet50_Weights.IMAGENET1K_V2
+    model = models.resnet50(weights=weights)
+
+    # --- 6-BAND MODIFICATION ---
+    old_conv = model.conv1
+    # Create a new layer with 6 input channels instead of 3
+    new_conv = nn.Conv2d(6, old_conv.out_channels, 
+                         kernel_size=old_conv.kernel_size, 
+                         stride=old_conv.stride, 
+                         padding=old_conv.padding, 
+                         bias=old_conv.bias is not None)
+
+    # Transfer pre-trained weights
+    with torch.no_grad():
+        # Keep original RGB weights for channels 0, 1, 2
+        new_conv.weight[:, :3, :, :] = old_conv.weight
+        
+        # Initialize channels 3, 4, 5 (textures) with the average of the RGB weights
+        # This gives the network a stable, non-random starting point
+        new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+
+    # Replace the layer in the model
+    model.conv1 = new_conv
+    # ---------------------------
+
+    if freeze_backbone:
+        for p in model.parameters():
+            p.requires_grad = False
+        # Always make sure the new conv1 can train, even if backbone is frozen
+        for p in model.conv1.parameters():
+            p.requires_grad = True
+
+    in_feats = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Linear(in_feats, 256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.4),
+        nn.Linear(256, 1),
     )
 
-training_dataset = (
-    tf.data.Dataset.from_tensor_slices((X_train, y_train))
-    .shuffle(1000)
-    .batch(BATCH_SIZE)
-    .prefetch(tf.data.AUTOTUNE)
-)
-
-validation_dataset = (
-    tf.data.Dataset.from_tensor_slices((X_val, y_val))
-    .batch(BATCH_SIZE)
-    .prefetch(tf.data.AUTOTUNE)
-)
+    return model.to(device)
 
 
-# ============================================================
-# MODEL: VGG16 (frozen) + classification head
-# ============================================================
-vgg16_feat_extr = VGG16(
-    include_top=False,
-    input_shape=(CHIP_SIZE, CHIP_SIZE, 3),
-    weights="imagenet"
-)
-vgg16_feat_extr.trainable = False
-
-x = vgg16_feat_extr.layers[14].output
-x = Flatten()(x)
-x = Dense(256, activation="relu")(x)
-outputs = Dense(1, activation="sigmoid")(x)
-
-pretrained_model = Model(inputs=vgg16_feat_extr.input, outputs=outputs)
-pretrained_model.summary()
+def build_optimizer(model):
+    """Differentiated learning rates: lower for early backbone layers,
+    higher for later layers, highest for the new classification head."""
+    param_groups = [
+        {"params": model.conv1.parameters(),  "lr": cfg.LR * 0.1},
+        {"params": model.bn1.parameters(),    "lr": cfg.LR * 0.1},
+        {"params": model.layer1.parameters(), "lr": cfg.LR * 0.1},
+        {"params": model.layer2.parameters(), "lr": cfg.LR * 0.1},
+        {"params": model.layer3.parameters(), "lr": cfg.LR * 0.3},
+        {"params": model.layer4.parameters(), "lr": cfg.LR * 0.5},
+        {"params": model.fc.parameters(),     "lr": cfg.LR * 10},
+    ]
+    # Filter out groups with no trainable params (e.g. if backbone is frozen)
+    param_groups = [g for g in param_groups if any(p.requires_grad for p in g["params"])]
+    return torch.optim.Adam(param_groups, weight_decay=cfg.WEIGHT_DECAY)
 
 
-# ============================================================
-# COMPILE + TRAIN
-# ============================================================
-pretrained_model.compile(
-    optimizer=RMSprop(learning_rate=1e-5),
-    loss="binary_crossentropy",
-    metrics=["accuracy"]
-)
+def load_model(device, model_path=None):
+    """Load a saved model checkpoint for inference."""
+    model_path = model_path or cfg.MODEL_PATH
+    checkpoint = torch.load(model_path, map_location=device)
 
-diagnostics = pretrained_model.fit(
-    training_dataset,
-    epochs=EPOCHS,
-    validation_data=validation_dataset
-)
+    model = build_model(device, freeze_backbone=False)
+
+    if "state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["state_dict"])
+        optimal_threshold = checkpoint.get("optimal_threshold", cfg.DEFAULT_THRESHOLD)
+    else:
+        model.load_state_dict(checkpoint)
+        optimal_threshold = cfg.DEFAULT_THRESHOLD
+
+    model.eval()
+    print(f"Loaded model from: {model_path}")
+    print(f"Using loaded Optimal Decision Threshold: {optimal_threshold:.4f}")
+    return model, optimal_threshold
 
 
 # ============================================================
-# SAVE MODEL
+# TIFF / RASTER HANDLING
 # ============================================================
-pretrained_model.save(MODEL_PATH)
-print(f"Model saved to:\n{MODEL_PATH}")
+def scale_raster_array(arr, src_dtype=None):
+    """Scale a raw raster array (any band count, any dtype) to 0-255 float32.
+
+    Uses the SOURCE DTYPE's known range where possible, rather than each
+    chip's own min/max. Per-chip max-scaling makes contrast relative to
+    each individual chip (washing out real brightness signal like rubble
+    vs. intact roofs) and would scale training/inference chips differently
+    whenever their local max values differ -- important once you're not
+    guaranteed fixed 8-bit JPEGs anymore.
+    """
+    arr = np.nan_to_num(arr.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
+    dtype_str = str(src_dtype) if src_dtype is not None else None
+
+    if dtype_str == "uint8":
+        pass  # already 0-255
+    elif dtype_str == "uint16":
+        arr = arr / 65535.0 * 255.0
+    elif dtype_str == "int16":
+        arr = np.clip(arr, 0, None) / 32767.0 * 255.0
+    elif dtype_str in ("float32", "float64") or dtype_str is None:
+        m = arr.max()
+        if m <= 1.5:
+            arr = arr * 255.0          # already 0-1 float
+        elif m <= 255.5:
+            pass                        # already 0-255
+        else:
+            # Unrecognized high-range float (e.g. scaled reflectance, raw DN) --
+            # fall back to per-chip max scaling as a last resort only.
+            arr = arr / max(m, 1.0) * 255.0
+    else:
+        # Unknown/unsupported dtype -- fallback to per-chip max scaling
+        m = arr.max()
+        arr = arr / max(m, 1.0) * 255.0
+
+    return np.clip(arr, 0, 255)
+
+
+def rasterio_tensor_loader(path):
+    """Reads all 6 bands and returns a PyTorch Tensor."""
+    with rasterio.open(path) as src:
+        # Read all available bands (should be 6)
+        arr = src.read(masked=True) 
+        
+    arr = np.ma.filled(arr, 0).astype("float32")
+    # Scale to 0-1 range for neural network input
+    arr = arr / 255.0 
+    
+    # Return as a PyTorch Tensor (Channels, Height, Width)
+    return torch.from_numpy(arr)
 
 
 # ============================================================
-# PLOT TRAINING RESULTS
+# DATA
 # ============================================================
-history = diagnostics.history
+def get_dataloaders():
+    train_tf = v2.Compose([
+        v2.RandomResizedCrop(cfg.CHIP_SIZE, scale=(0.7, 1.0)),
+        v2.RandomHorizontalFlip(),
+        v2.RandomVerticalFlip(),
+        v2.RandomRotation(180),
+        # Normalization across 6 bands. You can use 0.5 for all bands as a safe default.
+        v2.Normalize(mean=[0.5]*6, std=[0.5]*6), 
+    ])
+    
+    eval_tf = v2.Compose([
+        v2.Resize((cfg.CHIP_SIZE, cfg.CHIP_SIZE)),
+        v2.Normalize(mean=[0.5]*6, std=[0.5]*6),
+    ])
 
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 2, 1)
-plt.plot(history["loss"], label="train loss")
-plt.plot(history["val_loss"], label="val loss")
-plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Loss")
-plt.subplot(1, 2, 2)
-plt.plot(history["accuracy"], label="train acc")
-plt.plot(history["val_accuracy"], label="val acc")
-plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(); plt.title("Accuracy")
-plt.tight_layout()
-plt.show()
+    # IMPORTANT: Use the new loader
+    full_ds_train = datasets.ImageFolder(cfg.TRAIN_DIR, transform=train_tf,
+                                         loader=rasterio_tensor_loader)
+    full_ds_eval  = datasets.ImageFolder(cfg.TRAIN_DIR, transform=eval_tf,
+                                         loader=rasterio_tensor_loader)
+
+    print(f"Classes found: {full_ds_train.classes}")
+    print(f"Class -> index: {full_ds_train.class_to_idx}")
+    print(f"Total images: {len(full_ds_train)}")
+
+    if len(full_ds_train.classes) < 2:
+        print("⚠️ Only one class folder found — you need at least two subfolders!")
+
+    cfg.CLASS_NAMES = {v: k for k, v in full_ds_train.class_to_idx.items()}
+
+    labels = np.array(full_ds_train.targets)
+    for idx, name in cfg.CLASS_NAMES.items():
+        print(f"  class '{name}' (idx {idx}): {(labels == idx).sum()} images")
+
+    # Stratified split keeps class ratio consistent between train/val
+    all_idx = np.arange(len(full_ds_train))
+    train_idx, val_idx = train_test_split(
+        all_idx,
+        test_size=cfg.VAL_SPLIT,
+        random_state=cfg.SEED,
+        stratify=labels,
+    )
+
+    train_ds = Subset(full_ds_train, train_idx)
+    val_ds   = Subset(full_ds_eval, val_idx)
+    print(f"Split -> train: {len(train_ds)}, val: {len(val_ds)}")
+
+    train_labels = labels[train_idx]
+    for idx, name in cfg.CLASS_NAMES.items():
+        print(f"  train class '{name}': {(train_labels == idx).sum()} images")
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+                               num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False,
+                               num_workers=0, pin_memory=True)
+
+    # pos_weight for BCEWithLogitsLoss: balances rarer class.
+    # pos_weight = (# negatives) / (# positives), where "positive" = class 1
+    n_pos = int((train_labels == 1).sum())
+    n_neg = int((train_labels == 0).sum())
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
+    print(f"Class balance in train set -> class 0: {n_neg}, class 1: {n_pos}, "
+          f"pos_weight for BCEWithLogitsLoss: {pos_weight.item():.3f}")
+
+    return train_loader, val_loader, pos_weight
+
+
+# ============================================================
+# TRAINING & THRESHOLD OPTIMIZATION
+# ============================================================
+def run_epoch(model, loader, criterion, optimizer, device, train=True, scaler=None):
+    model.train() if train else model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_logits, all_targets = [], []
+
+    torch.set_grad_enabled(train)
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.float().to(device, non_blocking=True).unsqueeze(1)
+
+        if train:
+            optimizer.zero_grad()
+
+        if scaler is not None and train:
+            with torch.amp.autocast('cuda'):
+                logits = model(xb)
+                loss = criterion(logits, yb)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            if train:
+                loss.backward()
+                optimizer.step()
+
+        probs = torch.sigmoid(logits.detach())
+        total_loss += loss.item() * xb.size(0)
+        correct += ((probs >= 0.5).float() == yb).sum().item()
+        total += xb.size(0)
+
+        all_logits.extend(probs.cpu().numpy())
+        all_targets.extend(yb.cpu().numpy())
+
+    return total_loss / total, correct / total, np.array(all_logits), np.array(all_targets)
+
+
+def find_best_threshold(val_probs, val_targets):
+    """Finds the decision threshold that maximizes the F1-Score on the Validation Set."""
+    precisions, recalls, thresholds = precision_recall_curve(val_targets, val_probs)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_idx = np.argmax(f1_scores)
+
+    if best_idx < len(thresholds):
+        best_thresh = float(thresholds[best_idx])
+    else:
+        best_thresh = 0.5
+
+    print(f"\n--- Scientific Threshold Optimization ---")
+    print(f"Optimal Threshold (Max F1-Score): {best_thresh:.4f}")
+    print(f"Max Validation F1-Score:           {f1_scores[best_idx]:.4f}")
+    return best_thresh, float(f1_scores[best_idx])
+
+
+def train_model(model, train_loader, val_loader, pos_weight, device):
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    optimizer = build_optimizer(model)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3
+    )
+    scaler = torch.cuda.amp.GradScaler() if (cfg.USE_AMP and device.type == "cuda") else None
+
+    best_score = float("inf") if cfg.SELECT_ON == "val_loss" else -float("inf")
+    bad_epochs = 0
+    best_model_state = None
+    best_val_probs, best_val_targets = None, None
+
+    history = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+    for epoch in range(cfg.EPOCHS):
+        tr_loss, tr_acc, _, _ = run_epoch(model, train_loader, criterion, optimizer, device, True, scaler)
+        va_loss, va_acc, va_probs, va_targets = run_epoch(model, val_loader, criterion, optimizer, device, False)
+        scheduler.step(va_loss)
+
+        va_f1 = f1_score(va_targets, (va_probs >= 0.5).astype(int), zero_division=0)
+
+        history["loss"].append(tr_loss)
+        history["accuracy"].append(tr_acc)
+        history["val_loss"].append(va_loss)
+        history["val_accuracy"].append(va_acc)
+
+        lr_now = optimizer.param_groups[-1]["lr"]  # head LR
+        print(f"Epoch {epoch+1:02d}/{cfg.EPOCHS} "
+              f"- loss {tr_loss:.4f} acc {tr_acc:.4f} "
+              f"- val_loss {va_loss:.4f} val_acc {va_acc:.4f} val_f1 {va_f1:.4f} "
+              f"- lr {lr_now:.1e}")
+
+        current_score = va_loss if cfg.SELECT_ON == "val_loss" else va_f1
+        improved = (current_score < best_score) if cfg.SELECT_ON == "val_loss" else (current_score > best_score)
+
+        if improved:
+            best_score = current_score
+            bad_epochs = 0
+            best_model_state = model.state_dict().copy()
+            best_val_probs = va_probs
+            best_val_targets = va_targets
+            print(f"   ✓ New best ({cfg.SELECT_ON} {best_score:.4f}) — checkpoint cached")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= cfg.PATIENCE:
+                print(f"   Early stopping at epoch {epoch+1}")
+                break
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        optimal_threshold, best_f1 = find_best_threshold(best_val_probs, best_val_targets)
+        save_model_with_metadata(model, optimal_threshold, best_f1)
+
+    return history
+
+
+def save_model_with_metadata(model, threshold, val_f1=None, model_path=None):
+    model_path = model_path or cfg.MODEL_PATH
+    checkpoint = {
+        "state_dict": model.state_dict(),
+        "optimal_threshold": threshold,
+        "val_f1": val_f1,
+    }
+    torch.save(checkpoint, model_path)
+    print(f"Model and Optimal Threshold ({threshold:.4f}) saved to: {model_path}")
+
+
+def plot_history(history):
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history["loss"], label="train loss")
+    plt.plot(history["val_loss"], label="val loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Loss")
+    plt.subplot(1, 2, 2)
+    plt.plot(history["accuracy"], label="train acc")
+    plt.plot(history["val_accuracy"], label="val acc")
+    plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(); plt.title("Accuracy")
+    plt.tight_layout()
+    plt.show()
+
+
+def do_training():
+    device = get_device()
+    train_loader, val_loader, pos_weight = get_dataloaders()
+    model = build_model(device)
+    history = train_model(model, train_loader, val_loader, pos_weight, device)
+    plot_history(history)
+    return model, device
+
+
+if __name__ == "__main__":
+
+    trained_model, dev = (None, None)
+
+    trained_model, dev = do_training()
