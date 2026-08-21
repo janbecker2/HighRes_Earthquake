@@ -5,14 +5,14 @@ from skimage.filters import sobel as skimage_sobel
 def compute_sobel_texture(img, band=0, nodata=None, scale=None, to_gray=False):
     img = np.asarray(img)
 
-    # auto-detect scale from dtype if not given
+    # auto-detect scale 
     if scale is None:
         if np.issubdtype(img.dtype, np.integer):
             scale = float(np.iinfo(img.dtype).max)   # e.g. 255 for uint8, 65535 for uint16
         else:
             scale = 1.0
 
-    # select band / convert to grayscale
+    # select band and convert to grayscale
     if img.ndim == 3:
         if to_gray and img.shape[0] == 3:
             # luminance conversion (Rec. 601)
@@ -22,7 +22,6 @@ def compute_sobel_texture(img, band=0, nodata=None, scale=None, to_gray=False):
     else:
         band_data = img.astype("float32")
 
-    # mask nodata (must be done AFTER converting to float so NaN is allowed)
     if nodata is not None:
         band_data[band_data == nodata] = np.nan
 
