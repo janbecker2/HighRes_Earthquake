@@ -17,36 +17,31 @@ from rasterio.windows import Window, from_bounds
 from shapely.geometry import box
 from PIL import Image
 
-
-# ============================================================
-# CONFIG
-# ============================================================
+# set parameters and paths
 class Config:
     # --- Training data (one subfolder per class) ---
     TRAIN_DIR    = r"C:\Users\job02\Downloads\training_images_textures_without_b2"
     VAL_SPLIT    = 0.2
-    CHIP_SIZE    = 224          # ResNet default input size
+    CHIP_SIZE    = 224          
     BATCH_SIZE   = 32
     EPOCHS       = 40
-    LR           = 1e-4         # Base learning rate (head gets 10x, backbone less)
-    WEIGHT_DECAY = 1e-4         # Regularization against overfitting
-    FREEZE_BACKBONE = False     # False = full fine-tuning
-    PATIENCE     = 6            # Early stopping patience
+    LR           = 1e-4         
+    WEIGHT_DECAY = 1e-4         
+    FREEZE_BACKBONE = False    
+    PATIENCE     = 6            
     SEED         = 42
-    SELECT_ON    = "val_f1"     # "val_loss" or "val_f1" -- metric used for checkpointing
-    USE_AMP      = True         # Mixed precision (only active if CUDA available)
+    SELECT_ON    = "val_f1"    
+    USE_AMP      = True         
 
-    # --- Model file ---
     MODEL_PATH   = r"C:\Users\job02\Downloads\resnet50_damaged_wo_b2.pth"
 
-    # --- Inference (footprints + big tif) ---
     INFER_RASTER = r"C:\Users\job02\Downloads\aoi_karamankaras.tif"
     FOOTPRINTS   = r"C:\Users\job02\Downloads\2023Turkey_earthquake_data\2023Turkey_earthquake_data\GBA_building_footprint\Turkey_GBA_building_data.shp"
     FOOT_LAYER   = None
     OUTPUT_GPKG  = r"C:\Users\job02\Downloads\buildings_classified.gpkg"
     PAD_FRAC     = 0.15
     BATCH_INFER  = 64
-    DEFAULT_THRESHOLD = 0.5    # Fallback if no threshold metadata found
+    DEFAULT_THRESHOLD = 0.5   
 
     # ImageNet normalization 
     NORM_MEAN = [0.485, 0.456, 0.406]
@@ -57,10 +52,7 @@ class Config:
 
 cfg = Config()
 
-
-# ============================================================
-# DEVICE
-# ============================================================
+# use gpu if available
 def get_device():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -68,7 +60,7 @@ def get_device():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     return device
 
-
+# build model with 6 band input layer
 def build_model(device, freeze_backbone=None):
     freeze_backbone = cfg.FREEZE_BACKBONE if freeze_backbone is None else freeze_backbone
     torch.manual_seed(cfg.SEED)
@@ -77,32 +69,24 @@ def build_model(device, freeze_backbone=None):
     weights = models.ResNet50_Weights.IMAGENET1K_V2
     model = models.resnet50(weights=weights)
 
-    # --- 6-BAND MODIFICATION ---
     old_conv = model.conv1
-    # Create a new layer with 6 input channels instead of 3
     new_conv = nn.Conv2d(6, old_conv.out_channels, 
                          kernel_size=old_conv.kernel_size, 
                          stride=old_conv.stride, 
                          padding=old_conv.padding, 
                          bias=old_conv.bias is not None)
 
-    # Transfer pre-trained weights
     with torch.no_grad():
         # Keep original RGB weights for channels 0, 1, 2
         new_conv.weight[:, :3, :, :] = old_conv.weight
         
-        # Initialize channels 3, 4, 5 (textures) with the average of the RGB weights
-        # This gives the network a stable, non-random starting point
         new_conv.weight[:, 3:, :, :] = old_conv.weight.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
 
-    # Replace the layer in the model
     model.conv1 = new_conv
-    # ---------------------------
 
     if freeze_backbone:
         for p in model.parameters():
             p.requires_grad = False
-        # Always make sure the new conv1 can train, even if backbone is frozen
         for p in model.conv1.parameters():
             p.requires_grad = True
 
@@ -116,10 +100,8 @@ def build_model(device, freeze_backbone=None):
 
     return model.to(device)
 
-
+# build training optimizer with automatic learning curve
 def build_optimizer(model):
-    """Differentiated learning rates: lower for early backbone layers,
-    higher for later layers, highest for the new classification head."""
     param_groups = [
         {"params": model.conv1.parameters(),  "lr": cfg.LR * 0.1},
         {"params": model.bn1.parameters(),    "lr": cfg.LR * 0.1},
@@ -129,13 +111,11 @@ def build_optimizer(model):
         {"params": model.layer4.parameters(), "lr": cfg.LR * 0.5},
         {"params": model.fc.parameters(),     "lr": cfg.LR * 10},
     ]
-    # Filter out groups with no trainable params (e.g. if backbone is frozen)
     param_groups = [g for g in param_groups if any(p.requires_grad for p in g["params"])]
     return torch.optim.Adam(param_groups, weight_decay=cfg.WEIGHT_DECAY)
 
-
+# load existing model (not used in this script)
 def load_model(device, model_path=None):
-    """Load a saved model checkpoint for inference."""
     model_path = model_path or cfg.MODEL_PATH
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -153,20 +133,8 @@ def load_model(device, model_path=None):
     print(f"Using loaded Optimal Decision Threshold: {optimal_threshold:.4f}")
     return model, optimal_threshold
 
-
-# ============================================================
-# TIFF / RASTER HANDLING
-# ============================================================
+# scale raster for model imput
 def scale_raster_array(arr, src_dtype=None):
-    """Scale a raw raster array (any band count, any dtype) to 0-255 float32.
-
-    Uses the SOURCE DTYPE's known range where possible, rather than each
-    chip's own min/max. Per-chip max-scaling makes contrast relative to
-    each individual chip (washing out real brightness signal like rubble
-    vs. intact roofs) and would scale training/inference chips differently
-    whenever their local max values differ -- important once you're not
-    guaranteed fixed 8-bit JPEGs anymore.
-    """
     arr = np.nan_to_num(arr.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
     dtype_str = str(src_dtype) if src_dtype is not None else None
 
@@ -179,45 +147,35 @@ def scale_raster_array(arr, src_dtype=None):
     elif dtype_str in ("float32", "float64") or dtype_str is None:
         m = arr.max()
         if m <= 1.5:
-            arr = arr * 255.0          # already 0-1 float
+            arr = arr * 255.0         
         elif m <= 255.5:
-            pass                        # already 0-255
+            pass                        
         else:
-            # Unrecognized high-range float (e.g. scaled reflectance, raw DN) --
-            # fall back to per-chip max scaling as a last resort only.
             arr = arr / max(m, 1.0) * 255.0
     else:
-        # Unknown/unsupported dtype -- fallback to per-chip max scaling
         m = arr.max()
         arr = arr / max(m, 1.0) * 255.0
 
     return np.clip(arr, 0, 255)
 
-
+# load raster as tensor
 def rasterio_tensor_loader(path):
-    """Reads all 6 bands and returns a PyTorch Tensor."""
     with rasterio.open(path) as src:
-        # Read all available bands (should be 6)
         arr = src.read(masked=True) 
         
     arr = np.ma.filled(arr, 0).astype("float32")
-    # Scale to 0-1 range for neural network input
     arr = arr / 255.0 
     
-    # Return as a PyTorch Tensor (Channels, Height, Width)
     return torch.from_numpy(arr)
 
 
-# ============================================================
-# DATA
-# ============================================================
+# loaders to access training data
 def get_dataloaders():
     train_tf = v2.Compose([
         v2.RandomResizedCrop(cfg.CHIP_SIZE, scale=(0.7, 1.0)),
         v2.RandomHorizontalFlip(),
         v2.RandomVerticalFlip(),
         v2.RandomRotation(180),
-        # Normalization across 6 bands. You can use 0.5 for all bands as a safe default.
         v2.Normalize(mean=[0.5]*6, std=[0.5]*6), 
     ])
     
@@ -226,7 +184,6 @@ def get_dataloaders():
         v2.Normalize(mean=[0.5]*6, std=[0.5]*6),
     ])
 
-    # IMPORTANT: Use the new loader
     full_ds_train = datasets.ImageFolder(cfg.TRAIN_DIR, transform=train_tf,
                                          loader=rasterio_tensor_loader)
     full_ds_eval  = datasets.ImageFolder(cfg.TRAIN_DIR, transform=eval_tf,
@@ -237,7 +194,7 @@ def get_dataloaders():
     print(f"Total images: {len(full_ds_train)}")
 
     if len(full_ds_train.classes) < 2:
-        print("⚠️ Only one class folder found — you need at least two subfolders!")
+        print("Only one class folder found")
 
     cfg.CLASS_NAMES = {v: k for k, v in full_ds_train.class_to_idx.items()}
 
@@ -245,7 +202,6 @@ def get_dataloaders():
     for idx, name in cfg.CLASS_NAMES.items():
         print(f"  class '{name}' (idx {idx}): {(labels == idx).sum()} images")
 
-    # Stratified split keeps class ratio consistent between train/val
     all_idx = np.arange(len(full_ds_train))
     train_idx, val_idx = train_test_split(
         all_idx,
@@ -267,8 +223,6 @@ def get_dataloaders():
     val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False,
                                num_workers=0, pin_memory=True)
 
-    # pos_weight for BCEWithLogitsLoss: balances rarer class.
-    # pos_weight = (# negatives) / (# positives), where "positive" = class 1
     n_pos = int((train_labels == 1).sum())
     n_neg = int((train_labels == 0).sum())
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
@@ -278,9 +232,7 @@ def get_dataloaders():
     return train_loader, val_loader, pos_weight
 
 
-# ============================================================
-# TRAINING & THRESHOLD OPTIMIZATION
-# ============================================================
+# run epoch with optimization
 def run_epoch(model, loader, criterion, optimizer, device, train=True, scaler=None):
     model.train() if train else model.eval()
     total_loss, correct, total = 0.0, 0, 0
@@ -318,9 +270,8 @@ def run_epoch(model, loader, criterion, optimizer, device, train=True, scaler=No
 
     return total_loss / total, correct / total, np.array(all_logits), np.array(all_targets)
 
-
+# find best decision threshold based on val f1 score
 def find_best_threshold(val_probs, val_targets):
-    """Finds the decision threshold that maximizes the F1-Score on the Validation Set."""
     precisions, recalls, thresholds = precision_recall_curve(val_targets, val_probs)
     f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
     best_idx = np.argmax(f1_scores)
@@ -335,7 +286,7 @@ def find_best_threshold(val_probs, val_targets):
     print(f"Max Validation F1-Score:           {f1_scores[best_idx]:.4f}")
     return best_thresh, float(f1_scores[best_idx])
 
-
+# actual training of model
 def train_model(model, train_loader, val_loader, pos_weight, device):
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     optimizer = build_optimizer(model)
@@ -400,7 +351,7 @@ def save_model_with_metadata(model, threshold, val_f1=None, model_path=None):
         "val_f1": val_f1,
     }
     torch.save(checkpoint, model_path)
-    print(f"Model and Optimal Threshold ({threshold:.4f}) saved to: {model_path}")
+    print(f"Model and Optimal Threshold ({threshold:.4f})")
 
 
 def plot_history(history):
@@ -416,7 +367,7 @@ def plot_history(history):
     plt.tight_layout()
     plt.show()
 
-
+# executef
 def do_training():
     device = get_device()
     train_loader, val_loader, pos_weight = get_dataloaders()
