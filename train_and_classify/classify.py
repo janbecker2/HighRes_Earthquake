@@ -25,7 +25,6 @@ class Config:
     BATCH_INFER  = 64
     DEFAULT_THRESHOLD = 0.5    # Fallback if no threshold metadata found
 
-    # normalization has to match training
     NORM_MEAN = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
     NORM_STD  = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
@@ -49,7 +48,6 @@ def build_model(device, freeze_backbone=False):
     weights = models.ResNet50_Weights.IMAGENET1K_V2
     model = models.resnet50(weights=weights)
 
-    # --- 6-BAND MODIFICATION ---
     old_conv = model.conv1
     # Create a new layer with 6 input channels instead of 3
     model.conv1 = nn.Conv2d(6, old_conv.out_channels, 
@@ -57,7 +55,6 @@ def build_model(device, freeze_backbone=False):
                             stride=old_conv.stride, 
                             padding=old_conv.padding, 
                             bias=old_conv.bias is not None)
-    # ---------------------------
 
     if freeze_backbone:
         for p in model.parameters():
@@ -75,7 +72,6 @@ def build_model(device, freeze_backbone=False):
 
 # load model with helper function
 def load_model(device, model_path=None):
-    """Load a saved model checkpoint for inference."""
     model_path = model_path or cfg.MODEL_PATH
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -96,7 +92,6 @@ def load_model(device, model_path=None):
 
 # scale raster to match model training
 def scale_raster_array(arr, src_dtype=None):
-    """Scale a raw raster array (any band count, any dtype) to 0-255 float32."""
     arr = np.nan_to_num(arr.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
     dtype_str = str(src_dtype) if src_dtype is not None else None
 
@@ -123,9 +118,6 @@ def scale_raster_array(arr, src_dtype=None):
 
 # convert a raster chip to a tensor for model input
 def _chip_to_tensor(chip_hwc, chip_size, src_dtype=None):
-    """(6,H,W) raw raster values -> resized + ImageNet-normalized tensor
-    (6,chip,chip). Scales using the raster's actual dtype (via
-    scale_raster_array) instead of assuming 8-bit input."""
     chip = scale_raster_array(chip_hwc, src_dtype=src_dtype)  # -> 0-255 float32
     chip = chip / 255.0                                        # -> 0-1
 
@@ -134,7 +126,6 @@ def _chip_to_tensor(chip_hwc, chip_size, src_dtype=None):
         t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
     ).squeeze(0)                               # (6,chip,chip)
 
-    # Update the view from 3 to 6
     mean = torch.tensor(cfg.NORM_MEAN).view(6, 1, 1)
     std  = torch.tensor(cfg.NORM_STD).view(6, 1, 1)
     t = (t - mean) / std
@@ -146,7 +137,6 @@ def classify_footprints(model, device, threshold=None,
                         infer_raster=None, footprints=None,
                         output_gpkg=None, foot_layer=None,
                         pad_frac=None, batch_infer=None, class_names=None):
-    """Classify each building footprint that falls within the raster extent."""
     infer_raster = infer_raster or cfg.INFER_RASTER
     footprints   = footprints   or cfg.FOOTPRINTS
     output_gpkg  = output_gpkg  or cfg.OUTPUT_GPKG
@@ -158,8 +148,6 @@ def classify_footprints(model, device, threshold=None,
 
     class_for_1 = class_names[1]
     class_for_0 = class_names[0]
-    print(f"\n--- Running Inference ---")
-    print(f"Applying Threshold: prob >= {threshold:.4f} -> '{class_for_1}', else '{class_for_0}'")
 
     with rasterio.open(infer_raster) as src:
         raster_crs    = src.crs
@@ -263,7 +251,6 @@ def classify_footprints(model, device, threshold=None,
           f"-> {n_dmg} '{class_for_1}', {n_ok - n_dmg} '{class_for_0}'")
 
     gdf.to_file(output_gpkg, driver="GPKG")
-    print(f"Saved classified footprints -> {output_gpkg}")
     return gdf
 
 # run inference
