@@ -6,14 +6,12 @@ import glcm
 import sobel
 
 
-# Function to load images from hard drive
+#  load images from hard drive
 def load_image(path, band=None):
 
-    # check if file exists or path is correct
     if not path.exists():
         raise FileNotFoundError(f"file not found: {path}")
 
-    # check if single band is set, else return complete image
     with rasterio.open(path) as src:
         profile = src.profile
         if band is not None:
@@ -26,20 +24,18 @@ def load_image(path, band=None):
     return img, profile
 
 
-# Load all supported images from folder (tif + jpg by default)
+# load all  images from folder
 def load_tifs(folder, patterns=("*.tif", "*.tiff", "*.jpg", "*.jpeg"),
               band=None, stack=False):
     folder = Path(folder)
 
-    # allow a single string pattern too, for backward compatibility
     if isinstance(patterns, str):
         patterns = (patterns,)
 
-    # collect files matching any of the patterns
     files = []
     for pat in patterns:
         files.extend(folder.glob(pat))
-    files = sorted(set(files))  # set() avoids duplicates on case-insensitive systems
+    files = sorted(set(files))  
 
     if not files:
         raise FileNotFoundError(
@@ -55,19 +51,15 @@ def load_tifs(folder, patterns=("*.tif", "*.tiff", "*.jpg", "*.jpeg"),
         names.append(f.name)
 
     if stack:
-        images = np.stack(images, axis=0)  # set stack=False if images have different heights/widths
+        images = np.stack(images, axis=0)  
 
     return {"images": images, "filenames": names, "profiles": profiles}
 
 
-# Debugging functions, delete later
-# result = load_tifs("aoi_clips/", stack=True)          # loads tif + jpg
-# result = load_tifs("aoi_clips/", patterns="*.jpg")    # only jpg
-# print(result["images"].shape)
-# print(result["filenames"])
 
 
-# Call texture analysis functions
+
+# call texture analysis functions
 def process_images(images, profiles=None, method="both", **kwargs):
 
     if isinstance(images, np.ndarray):

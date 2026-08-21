@@ -10,19 +10,13 @@ from rasterio.windows import Window, from_bounds
 from shapely.geometry import box
 
 
-# ============================================================
-# CONFIG
-# (Keep this identical to the Config in train_tif_ready.py --
-# MODEL_PATH, CHIP_SIZE, NORM_MEAN/STD, and CLASS_NAMES all need to match
-# whatever the model was actually trained with.)
-# ============================================================
+# config parameters and paths
 class Config:
-    CHIP_SIZE    = 224          # ResNet default input size -- must match training
+    CHIP_SIZE    = 224          # image size
 
-    # --- Model file ---
+
     MODEL_PATH   = r"C:\Users\job02\Downloads\resnet50_damaged_wo_b1.pth"
 
-    # --- Inference (footprints + big tif) ---
     INFER_RASTER = r"C:\Users\job02\Downloads\study1_textures.tif\study1_test_stack.tif"
     FOOTPRINTS   = r"C:\Users\job02\Downloads\2023Turkey_earthquake_data\2023Turkey_earthquake_data\GBA_building_footprint\Turkey_GBA_building_data.shp"
     FOOT_LAYER   = None
@@ -31,7 +25,7 @@ class Config:
     BATCH_INFER  = 64
     DEFAULT_THRESHOLD = 0.5    # Fallback if no threshold metadata found
 
-    # ImageNet normalization -- must match training
+    # normalization has to match training
     NORM_MEAN = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
     NORM_STD  = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
@@ -41,9 +35,7 @@ class Config:
 cfg = Config()
 
 
-# ============================================================
-# DEVICE
-# ============================================================
+
 def get_device():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -52,10 +44,7 @@ def get_device():
     return device
 
 
-# ============================================================
-# MODEL (must match the architecture used in training exactly, or
-# load_state_dict will fail / silently load into the wrong shapes)
-# ============================================================
+# building model
 def build_model(device, freeze_backbone=False):
     weights = models.ResNet50_Weights.IMAGENET1K_V2
     model = models.resnet50(weights=weights)
@@ -84,6 +73,7 @@ def build_model(device, freeze_backbone=False):
     return model.to(device)
 
 
+# load model with helper function
 def load_model(device, model_path=None):
     """Load a saved model checkpoint for inference."""
     model_path = model_path or cfg.MODEL_PATH
@@ -104,15 +94,7 @@ def load_model(device, model_path=None):
     return model, optimal_threshold
 
 
-# ============================================================
-# RASTER SCALING
-# Same dtype-aware scaling used in train_tif_ready.py's rasterio_pil_loader.
-# Keeping this identical between train and inference is what makes the
-# model's learned weights meaningful at inference time -- if training
-# chips were scaled one way (e.g. 16-bit -> /65535) and inference chips
-# another way (e.g. always /255), the model sees systematically different
-# input statistics than it was trained on.
-# ============================================================
+# scale raster to match model training
 def scale_raster_array(arr, src_dtype=None):
     """Scale a raw raster array (any band count, any dtype) to 0-255 float32."""
     arr = np.nan_to_num(arr.astype("float32"), nan=0.0, posinf=0.0, neginf=0.0)
@@ -139,6 +121,7 @@ def scale_raster_array(arr, src_dtype=None):
     return np.clip(arr, 0, 255)
 
 
+# convert a raster chip to a tensor for model input
 def _chip_to_tensor(chip_hwc, chip_size, src_dtype=None):
     """(6,H,W) raw raster values -> resized + ImageNet-normalized tensor
     (6,chip,chip). Scales using the raster's actual dtype (via
@@ -158,9 +141,7 @@ def _chip_to_tensor(chip_hwc, chip_size, src_dtype=None):
     return t
 
 
-# ============================================================
-# INFERENCE (Footprint-based)
-# ============================================================
+# classify footprints in raster
 def classify_footprints(model, device, threshold=None,
                         infer_raster=None, footprints=None,
                         output_gpkg=None, foot_layer=None,
@@ -285,7 +266,7 @@ def classify_footprints(model, device, threshold=None,
     print(f"Saved classified footprints -> {output_gpkg}")
     return gdf
 
-
+# run inference
 def do_inference():
     device = get_device()
     model, optimal_threshold = load_model(device)
