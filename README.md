@@ -39,6 +39,7 @@ The workflow prepares building crops from annotated imagery, extracts texture in
 - Several file paths are currently hardcoded to local Windows directories.
 - Update the data and output paths before running the scripts in a new environment.
 - The model expects multi-band image inputs and uses a binary damaged/undamaged classification setup.
+- If no building footprint data is available, an example can be found here: https://zenodo.org/records/18437501
 
 ## Example usage
 
