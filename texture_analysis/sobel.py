@@ -8,7 +8,7 @@ def compute_sobel_texture(img, band=0, nodata=None, scale=None, to_gray=False):
     # auto-detect scale 
     if scale is None:
         if np.issubdtype(img.dtype, np.integer):
-            scale = float(np.iinfo(img.dtype).max)   # e.g. 255 for uint8, 65535 for uint16
+            scale = float(np.iinfo(img.dtype).max)   
         else:
             scale = 1.0
 
