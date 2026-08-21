@@ -15,7 +15,7 @@ MIN_HEIGHT = 64
 
 splits = ["train", "valid", "test"]
 
-print(f"Starting extraction (Filtering out buildings smaller than {MIN_WIDTH}x{MIN_HEIGHT} pixels)...")
+print(f"Starting extraction")
 
 os.makedirs(os.path.join(output_base_dir, "undestroyed"), exist_ok=True)
 os.makedirs(os.path.join(output_base_dir, "destroyed"), exist_ok=True)
@@ -91,4 +91,3 @@ for split in splits:
             
     print(f"  -> Extracted {count} buildings. (Skipped {skipped_size} for being too small).")
 
-print("\nAll done! Your filtered, combined dataset is ready.")
