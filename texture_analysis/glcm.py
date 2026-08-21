@@ -6,10 +6,7 @@ def compute_glcm_texture(img, win=15, step=2, levels=32,
                          props=("energy", "homogeneity"), nodata=None, scale=None):
     img = np.asarray(img, dtype=np.float32)
 
-    # auto-detect scale from ORIGINAL dtype (before float cast) if not given
-    # note: pass scale explicitly for float TIFFs if needed
     if scale is None:
-        # img was already cast to float32, so infer from value range instead
         max_val = np.nanmax(img)
         if max_val <= 1.0:
             scale = 1.0            # already normalized floats
