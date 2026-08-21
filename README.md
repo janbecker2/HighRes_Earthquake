@@ -39,11 +39,11 @@ The workflow prepares building crops from annotated imagery, extracts texture in
 - Several file paths are currently hardcoded to local Windows directories.
 - Update the data and output paths before running the scripts in a new environment.
 - The model expects multi-band image inputs and uses a binary damaged/undamaged classification setup.
-- If no building footprint data is available, an example can be found here: https://zenodo.org/records/18437501
+- If no building footprint data is available, an example can be found here: https://zenodo.org/records/18437501.
 
 ## Example usage
 
 - Run [extract.py](data_pre-processing/extract.py) to create training crops.
-- Prepare training data by calculating feature stacks with texture analysis features using [calculate_features.py](texture_analysis/texture_analysis.py)
+- Prepare training data by calculating feature stacks with texture analysis features using [calculate_features.py].(texture_analysis/texture_analysis.py)
 - Update paths in [train_model.py](train_and_classify/train_model.py) and train the model.
 - Run [classify.py](train_and_classify/classify.py) to classify imagery.
